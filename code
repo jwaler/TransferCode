@@ -1,0 +1,46 @@
+version: '3.9'
+
+services:
+  gvmd:
+    image: greenbone/gvmd:stable
+    container_name: gvmd
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - openvas
+    environment:
+      - GVMD_HOST=gvmd
+      - POSTGRES_DB=gvmd
+      - POSTGRES_USER=gvmd
+      - POSTGRES_PASSWORD=gvmd
+      - POSTGRES_HOST=postgres
+    ports:
+      - "9390:9390"
+      - "9392:9392"  # Web UI
+    volumes:
+      - gvmd-data:/var/lib/gvm
+
+  openvas:
+    image: greenbone/openvas:stable
+    container_name: openvas
+    restart: unless-stopped
+    depends_on:
+      - gvmd
+    volumes:
+      - openvas-data:/var/lib/openvas
+
+  postgres:
+    image: postgres:13
+    container_name: gvm-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=gvmd
+      - POSTGRES_USER=gvmd
+      - POSTGRES_PASSWORD=gvmd
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  gvmd-data:
+  openvas-data:
+  postgres-data:
