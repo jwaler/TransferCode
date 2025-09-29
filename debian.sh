@@ -114,7 +114,7 @@ INSTALLER="$EXTRACT_DIR/install.sh"
 if [ -f "$INSTALLER" ]; then
   LOG "Lancement de l'installateur Kasm : $INSTALLER"
   # Le script tourne déjà en root — pas besoin de sudo
-  bash "$INSTALLER"
+  bash "$INSTALLER" -y
 else
   LOG "ERREUR: install.sh introuvable dans $EXTRACT_DIR. Vérifie l'archive."
   exit 1
