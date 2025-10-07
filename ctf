@@ -1,0 +1,272 @@
+Nice — you already found the secret key and validated the HMAC/SHA256 signing process. Below I’ll give you a complete, ready‑to‑load Burp Python (Jython) extension that will automatically compute the HMAC‑SHA256 signature for outgoing requests and add it as the `X-Gophish-Signature` header (configurable). I’ll also include step‑by‑step instructions for loading it into Burp and a short note about using it together with `sqlmap`.
+
+> Important: Burp’s Python extensions run under **Jython (Python 2.7)**. Follow the load instructions below so Burp can run the script.
+
+---
+
+# What this extension does
+
+* Adds a tiny UI in the Extender tab where you can:
+
+  * paste your secret key,
+  * set a prefix for the signature header (default: `sha256=`),
+  * enable/disable the signer, and
+  * toggle "Only sign JSON bodies".
+* For each outgoing HTTP request Burp processes, if enabled and conditions match, it:
+
+  * extracts the request body bytes,
+  * computes `HMAC-SHA256(secret, body)` (UTF‑8),
+  * converts digest to lowercase hex,
+  * adds or replaces `X-Gophish-Signature: <prefix><hex>` header,
+  * rebuilds the request and forwards it.
+
+This is the usual approach for automating signature generation for tools such as Burp Intruder, Repeater, Scanner, or when you let Burp act as a proxy for `sqlmap` requests.
+
+---
+
+# The code (save as `gophish_hmac_signer.py`)
+
+Copy the whole file below exactly and save as `gophish_hmac_signer.py`.
+
+```python
+# gophish_hmac_signer.py
+# Burp extension (Jython) to compute HMAC-SHA256 over request body and add X-Gophish-Signature header.
+# Tested conceptually with Burp Extender + Jython 2.7 (adjust UI text/behavior as you like).
+
+from burp import IBurpExtender, IHttpListener, IExtensionHelpers
+from java.io import PrintWriter
+from java.lang import String
+from javax.swing import JPanel, JLabel, JTextField, JButton, JCheckBox, BoxLayout, SwingUtilities
+
+# Java crypto imports
+from javax.crypto import Mac
+from javax.crypto.spec import SecretKeySpec
+
+import binascii
+
+class BurpExtender(IBurpExtender, IHttpListener):
+    def registerExtenderCallbacks(self, callbacks):
+        # Keep references
+        self._callbacks = callbacks
+        self._helpers = callbacks.getHelpers()
+        self._stdout = PrintWriter(callbacks.getStdout(), True)
+        self._stderr = PrintWriter(callbacks.getStderr(), True)
+
+        # Extension name
+        callbacks.setExtensionName("Gophish HMAC Signer")
+
+        # Default config
+        self.secret = ""                    # set this in UI
+        self.header_name = "X-Gophish-Signature"
+        self.header_prefix = "sha256="      # default prefix; can be blank ""
+        self.enabled = False
+        self.only_json = True               # only sign if content-type application/json
+
+        # Create simple UI
+        self._build_ui(callbacks)
+
+        # Register as HTTP listener
+        callbacks.registerHttpListener(self)
+
+        self._stdout.println("[+] Gophish HMAC Signer loaded. Enter secret key and enable signing.")
+
+    def _build_ui(self, callbacks):
+        # Build a small panel
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+
+        # Secret key row
+        row1 = JPanel()
+        row1.add(JLabel("HMAC secret: "))
+        self.secret_field = JTextField(40)
+        row1.add(self.secret_field)
+        panel.add(row1)
+
+        # Prefix row
+        row2 = JPanel()
+        row2.add(JLabel("Header prefix (e.g. sha256= or leave blank): "))
+        self.prefix_field = JTextField(self.header_prefix, 20)
+        row2.add(self.prefix_field)
+        panel.add(row2)
+
+        # Options row
+        row3 = JPanel()
+        self.enable_checkbox = JCheckBox("Enable signing", False)
+        row3.add(self.enable_checkbox)
+        self.json_checkbox = JCheckBox("Only sign JSON bodies", self.only_json)
+        row3.add(self.json_checkbox)
+        panel.add(row3)
+
+        # Button row
+        row4 = JPanel()
+        apply_btn = JButton("Apply", actionPerformed=self._apply_settings)
+        row4.add(apply_btn)
+        panel.add(row4)
+
+        # Add to Burp UI
+        callbacks.addSuiteTab(panel)
+
+    def _apply_settings(self, event=None):
+        # Read UI fields
+        self.secret = str(self.secret_field.getText()).strip()
+        self.header_prefix = str(self.prefix_field.getText())
+        self.enabled = bool(self.enable_checkbox.isSelected())
+        self.only_json = bool(self.json_checkbox.isSelected())
+
+        self._stdout.println("[*] Settings updated: enabled=%s only_json=%s prefix='%s' secret_len=%d" % (
+            self.enabled, self.only_json, self.header_prefix, len(self.secret)
+        ))
+
+    # IHttpListener implementation
+    def processHttpMessage(self, toolFlag, isRequest, messageInfo):
+        # only operate on requests
+        if not isRequest:
+            return
+
+        if not self.enabled:
+            return
+
+        # must have a secret
+        if not self.secret:
+            return
+
+        try:
+            request = messageInfo.getRequest()
+            if request is None:
+                return
+
+            # request is a byte[] (Java)
+            req_bytes = request
+            helpers = self._helpers
+
+            # Analyze request to find headers and body offset
+            analyzed = helpers.analyzeRequest(req_bytes)
+            body_offset = analyzed.getBodyOffset()
+            body_bytes = req_bytes[body_offset:len(req_bytes)]
+
+            # Optionally only sign JSON
+            if self.only_json:
+                headers = analyzed.getHeaders()
+                # find Content-Type header
+                content_type = ""
+                for h in headers:
+                    h_low = h.lower()
+                    if h_low.startswith("content-type:"):
+                        content_type = h_low
+                        break
+                if "application/json" not in content_type:
+                    return
+
+            # compute HMAC-SHA256(secret, body_bytes)
+            sig_hex = self._hmac_sha256_hex(self.secret, body_bytes)
+
+            # Build/modify headers: remove existing header if present, add our header
+            headers = list(analyzed.getHeaders())  # Java List -> Python list wrapper, but treat as iterable
+            # Remove any existing header with same name (case-insensitive)
+            new_headers = []
+            lower_name = self.header_name.lower()
+            for h in headers:
+                if not h.lower().startswith(lower_name + ":"):
+                    new_headers.append(h)
+            # Add our header
+            header_value = self.header_prefix + sig_hex if self.header_prefix is not None else sig_hex
+            new_headers.append("%s: %s" % (self.header_name, header_value))
+
+            # Rebuild request
+            new_request = helpers.buildHttpMessage(new_headers, body_bytes)
+            messageInfo.setRequest(new_request)
+
+            # Debug print
+            self._stdout.println("[+] Signed request with %s%s" % (self.header_prefix, sig_hex))
+        except Exception as e:
+            self._stderr.println("[-] Error in Gophish HMAC Signer: %s" % str(e))
+
+    def _hmac_sha256_hex(self, secret_str, message_bytes):
+        # secret_str: Python str (unicode in Jython 2.7), message_bytes: Java byte[]
+        # Convert secret to bytes using UTF-8
+        secret_bytes = String(secret_str).getBytes("UTF-8")
+        # Java SecretKeySpec+Mac
+        key = SecretKeySpec(secret_bytes, "HmacSHA256")
+        mac = Mac.getInstance("HmacSHA256")
+        mac.init(key)
+        digest = mac.doFinal(message_bytes)
+        # Convert to hex string
+        hexstr = binascii.hexlify(digest).lower()
+        # binascii.hexlify returns java.lang.String? In Jython it returns a Python string-like object; convert to str
+        return str(hexstr)
+```
+
+---
+
+# How to use it (step by step)
+
+1. **Install Jython for Burp**
+
+   * Download the Jython standalone jar (e.g., `jython-standalone-2.7.2.jar`) and point Burp to it:
+
+     * Burp → Extender → Options → Python Environment → Select `jython-standalone-2.7.x.jar`.
+
+2. **Save the file**
+
+   * Save the extension from above as `gophish_hmac_signer.py`.
+
+3. **Load the extension**
+
+   * Burp → Extender → Extensions → Add → select `gophish_hmac_signer.py`.
+   * You should see `Gophish HMAC Signer loaded...` in Burp’s Extender output.
+
+4. **Configure**
+
+   * In the new extension UI in the Extender tab:
+
+     * Paste your secret key (e.g. `3CWVGMndgMvdVAz0jqBiTicmv7gxc6IS`).
+     * Set prefix: `sha256=` if the target expects `sha256=<hex>`; otherwise leave blank or match the target format.
+     * Check **Enable signing** and **Only sign JSON bodies** (or uncheck if you want to sign all requests).
+     * Click **Apply**.
+
+5. **Test**
+
+   * Send a known working request through Burp (Repeater or Proxy). Check in the proxy history or Repeater that the outgoing request now has `X-Gophish-Signature: sha256=<hex>` header and that responses show the request is accepted.
+   * The extension prints a line to Burp's Extender output for each signed request.
+
+---
+
+# Using with sqlmap
+
+You have two common workflows:
+
+**A. Run sqlmap through Burp Proxy**
+
+* Configure sqlmap to use Burp as an HTTP proxy: `--proxy="http://127.0.0.1:8080"`.
+* Burp will receive each sqlmap request, your extension will sign it, and Burp forwards the valid signed request to the target. This is the easiest: you do not need to change sqlmap’s requests; Burp adds valid signatures on the fly.
+
+**B. Use sqlmap -r with Burp-generated request files**
+
+* Less convenient: you can export a working signed request from Burp (right-click → Copy → Copy as Raw) and use that as a base `-r` file; but sqlmap will mutate the payload and those mutated requests will not have updated signatures unless you recompute them. So prefer proxying (A) or automating recompute (script + sqlmap wrapper).
+
+For typical CTFs, running sqlmap through Burp Proxy is quickest:
+
+```
+sqlmap -u "http://target/path" --data='{"campaign_id":2,"email":"...","message":"..."}' --headers='Content-Type: application/json' --proxy=http://127.0.0.1:8080 -p message
+```
+
+Let Burp sign each request with the extension.
+
+---
+
+# Notes and troubleshooting
+
+* If the target expects a different signature format (for example `X-Gophish-Signature: sha256=<hex>` vs `X-Gophish-Signature: <hex>`), change the `header_prefix` text in the UI accordingly.
+* If the target signs over a canonicalized string (not raw body bytes) you’ll need to replicate that canonicalization (e.g., whitespace, ordering). Check how the original signing was done (gophish typically signs the body bytes).
+* If Burp prints errors in Extender output, post those lines and I’ll help debug.
+* If the server rejects requests, re-check whether the signature should be computed over the raw body *bytes* (we do that), some systems use URL-decoded bodies or sign the JSON string with no whitespace — adjust accordingly.
+
+---
+
+If you want, paste the exact intercepted raw HTTP request you use in your lab (headers + body) and I’ll:
+
+* confirm the exact signature prefix/format expected,
+* adjust the extension to only modify requests to that host/path,
+* or produce a version that signs a canonicalized string if the target expects that.
+
+Want me to also provide a tiny Python wrapper that runs sqlmap payloads and recomputes signatures for each mutated payload (instead of proxying)? I can give that next if you'd rather not proxy through Burp.
